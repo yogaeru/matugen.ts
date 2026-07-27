@@ -1,0 +1,290 @@
+use crate::{
+    color::{
+        base16::{generate_base16_schemes, Backend},
+        color::{get_source_color, Source},
+        format::argb_from_rgb,
+        parse::parse_css_color,
+    },
+    parser::{engine::EngineSyntax, Engine},
+    scheme::{get_custom_color_schemes, get_schemes, SchemeTypes, Schemes, SchemesEnum},
+    util::{
+        arguments::Format,
+        color::{format_palettes, format_schemes},
+        config::ConfigFile,
+    },
+    wallpaper::{self, Wallpaper},
+};
+use color_eyre::{
+    eyre::{Context, Result},
+    Report,
+};
+use log::LevelFilter;
+use material_colors::{
+    color::Argb,
+    theme::{Theme, ThemeBuilder},
+};
+use serde_json::Value;
+use std::{fs::read_to_string, io::Write, path::PathBuf};
+
+use crate::util::arguments::Cli;
+
+pub fn apply_opacity_to_schemes(schemes: &mut Option<Schemes>, opacity: Option<f64>) {
+    if let Some(schemes) = schemes {
+        let alpha_val = (opacity.unwrap_or(1.0) * 255.0).round() as u8;
+
+        for color in schemes.dark.values_mut() {
+            color.alpha = alpha_val;
+        }
+
+        for color in schemes.light.values_mut() {
+            color.alpha = alpha_val;
+        }
+    }
+}
+
+pub fn merge_json_source(
+    mut json: Value,
+    md3_schemes: &Option<Schemes>,
+    base16_schemes: &Option<Schemes>,
+    theme: &Option<Theme>,
+    default_scheme: SchemesEnum,
+) -> Result<Value, Report> {
+    if let Some(schemes) = &md3_schemes {
+        let colors_md3 = format_schemes(&schemes, default_scheme, schemes.get_all_names());
+
+        let json_md3 = serde_json::json!({"colors": serde_json::to_value(colors_md3).wrap_err("Could not format md3 colors to JSON")?});
+
+        merge_json(&mut json, json_md3);
+    }
+
+    if let Some(base16) = base16_schemes {
+        let colors_base16 = format_schemes(&base16, default_scheme, base16.get_all_names());
+
+        let json_base16 = serde_json::json!({"base16": serde_json::to_value(colors_base16).wrap_err("Could not format base16 colors to JSON")?});
+
+        merge_json(&mut json, json_base16);
+    }
+
+    if let Some(theme) = theme {
+        let palettes = format_palettes(&theme.palettes, &Format::Hex);
+
+        let json_palettes = serde_json::json!({"palettes": serde_json::to_value(palettes).wrap_err("Could not format palettes to JSON")?});
+
+        merge_json(&mut json, json_palettes);
+    }
+
+    Ok(json)
+}
+
+pub fn generate_schemes_and_theme(
+    args: &Cli,
+    config_file: &ConfigFile,
+    scheme_type: SchemeTypes,
+) -> Result<
+    (
+        Option<Schemes>,
+        Option<Argb>,
+        Option<Theme>,
+        Option<Schemes>,
+    ),
+    Report,
+> {
+    let parsed_fallback_color = parse_fallback_color(config_file)?;
+    let source_color_index = args
+        .source_color_index
+        .or(config_file.config.source_color_index);
+    let source_color = match &args.source {
+        Source::Json { path: _ } => None,
+        _ => Some(
+            (get_source_color(
+                &args.source,
+                &args.resize_filter,
+                parsed_fallback_color,
+                &config_file.config.prefer,
+                &source_color_index,
+            ))
+            .wrap_err("Failed to get source color.")?,
+        ),
+    };
+
+    let contrast = args.contrast.or(config_file.config.contrast);
+
+    let (schemes, theme) = match source_color {
+        Some(color) => {
+            let theme = ThemeBuilder::with_source(color).build();
+            let (scheme_dark, scheme_light) = get_schemes(color, scheme_type, &contrast);
+
+            let mut schemes = get_custom_color_schemes(
+                color,
+                scheme_dark,
+                scheme_light,
+                &config_file.config.custom_colors,
+                scheme_type,
+                &contrast,
+                &args.lightness_dark,
+                &args.lightness_light,
+            );
+
+            schemes.dark.insert("source_color".to_owned(), color);
+            schemes.light.insert("source_color".to_owned(), color);
+            (Some(schemes), Some(theme))
+        }
+        None => (None, None),
+    };
+
+    let base_16 = match &args.source {
+        Source::Json { path: _ } => None,
+        _ => Some(
+            generate_base16_schemes(
+                &args.source,
+                args.base16_backend.clone().unwrap_or(Backend::Wal),
+            )
+            .wrap_err("Failed to generate base16 color schemes.")?,
+        ),
+    };
+
+    Ok((schemes, source_color, theme, base_16))
+}
+
+pub fn get_log_level(args: &Cli) -> LevelFilter {
+    let log_level: LevelFilter = if args.verbose == Some(true) {
+        LevelFilter::Info
+    } else if args.quiet == Some(true) {
+        LevelFilter::Off
+    } else if args.debug == Some(true) {
+        LevelFilter::Debug
+    } else {
+        LevelFilter::Warn
+    };
+    log_level
+}
+
+#[cfg(feature = "update-informer")]
+pub fn check_version() {
+    use update_informer::{registry, Check};
+
+    let name = env!("CARGO_PKG_NAME");
+    let current_version = env!("CARGO_PKG_VERSION");
+
+    let informer = update_informer::new(registry::Crates, name, current_version);
+
+    if let Some(version) = informer.check_version().ok().flatten() {
+        warn!(
+            "New version is available: <b><red>{}</> -> <b><green>{}</>",
+            current_version, version
+        );
+    }
+}
+
+pub fn get_syntax(
+    bprefix: Option<&String>,
+    bpostfix: Option<&String>,
+    eprefix: Option<&String>,
+    epostfix: Option<&String>,
+) -> EngineSyntax {
+    let mut syntax = EngineSyntax::default();
+
+    if let Some(bprefix) = bprefix {
+        syntax.block_left = bprefix.clone();
+    }
+    if let Some(bpostfix) = bpostfix {
+        syntax.block_right = bpostfix.clone();
+    }
+    if let Some(eprefix) = eprefix {
+        syntax.keyword_left = eprefix.clone();
+    }
+    if let Some(epostfix) = epostfix {
+        syntax.keyword_right = epostfix.clone();
+    }
+
+    syntax
+}
+
+pub fn json_from_file(path: &PathBuf) -> Result<serde_json::Value, Report> {
+    if !path.exists() {
+        error!(
+            "<d>The path <red><b>{}</><d> doesnt exist.</>",
+            path.display()
+        );
+    }
+    let json_string = read_to_string(path)?;
+    let json = serde_json::from_str(&json_string)?;
+    Ok(json)
+}
+
+pub fn setup_logging(args: &Cli) -> Result<(), Report> {
+    let log_level = get_log_level(args);
+
+    let mut logger = pretty_env_logger::env_logger::builder();
+
+    logger.filter_level(log_level);
+
+    if log_level != LevelFilter::Debug {
+        logger.format_module_path(false);
+        logger.format(|buf, record| writeln!(buf, "{}", record.args()));
+    } else {
+        // logger.format_timestamp(Some(pretty_env_logger::env_logger::fmt::TimestampPrecision::Nanos));
+        logger.format_timestamp_micros();
+    }
+
+    logger.try_init()?;
+
+    Ok(())
+}
+
+pub fn set_wallpaper(
+    source: &Source,
+    _wallpaper_cfg: &Wallpaper,
+    _engine: &mut Engine,
+) -> Result<(), Report> {
+    let path = match &source {
+        Source::Image { path } => path,
+        Source::ImageBytes { .. } => return Ok(()),
+        Source::Color { .. } => return Ok(()),
+        #[cfg(feature = "web-image")]
+        Source::WebImage { .. } => return Ok(()),
+        Source::Json { path: _ } => unreachable!(),
+    };
+
+    #[cfg(target_os = "windows")]
+    wallpaper::windows::set(path)?;
+    #[cfg(target_os = "macos")]
+    wallpaper::macos::set(&path)?;
+    #[cfg(any(target_os = "linux", target_os = "netbsd"))]
+    wallpaper::unix::set(path, _wallpaper_cfg, _engine)?;
+    Ok(())
+}
+
+pub fn merge_json(a: &mut Value, b: Value) {
+    match (a, b) {
+        (Value::Object(a_map), Value::Object(b_map)) => {
+            for (k, v_b) in b_map {
+                match a_map.get_mut(&k) {
+                    Some(v_a) => merge_json(v_a, v_b),
+                    None => {
+                        a_map.insert(k, v_b);
+                    }
+                }
+            }
+        }
+        // Arrays: append `b`'s items to `a`
+        (Value::Array(a_arr), Value::Array(b_arr)) => {
+            a_arr.extend(b_arr);
+        }
+        // For all other cases: replace `a` with `b`
+        (a_slot, b_val) => {
+            *a_slot = b_val;
+        }
+    }
+}
+
+pub fn parse_fallback_color(config_file: &ConfigFile) -> Result<Option<Argb>, Report> {
+    match &config_file.config.fallback_color {
+        Some(s) => {
+            let c = parse_css_color(&s)
+                .wrap_err("Failed to parse the fallback_color string as a css color")?;
+            Ok(Some(argb_from_rgb(&c)))
+        }
+        None => Ok(None),
+    }
+}

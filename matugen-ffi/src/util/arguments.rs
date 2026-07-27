@@ -1,0 +1,237 @@
+use clap::{ArgAction, Parser};
+use serde::{Deserialize, Serialize};
+use std::{fmt::Debug, ops::RangeBounds, path::PathBuf};
+
+use crate::{color::base16::Backend, SchemesEnum};
+
+#[derive(Parser, Clone)]
+#[command(version, long_about = None)]
+pub struct Cli {
+    /// Optional name to operate on
+    // name: Option<String>,
+    #[command(subcommand)]
+    pub source: crate::color::color::Source,
+
+    /// Sets a custom color scheme type
+    #[arg(
+        short,
+        long,
+        value_name = "TYPE",
+        global = true,
+        default_value = "scheme-tonal-spot"
+    )]
+    pub r#type: crate::scheme::SchemeTypes,
+
+    /// Sets a custom config file
+    #[arg(short, long, value_name = "FILE", global = true)]
+    pub config: Option<PathBuf>,
+
+    /// Adds a prefix before paths
+    #[arg(short, long, value_name = "PATH", global = true)]
+    pub prefix: Option<PathBuf>,
+
+    /// Value from -1 to 1. -1 represents minimum contrast, 0 represents
+    /// standard (i.e. the design as spec'd), and 1 represents maximum contrast.
+    #[arg(long, global = true, allow_negative_numbers = true)]
+    pub contrast: Option<f64>,
+
+    #[arg(short, long, global = true, action=ArgAction::SetTrue)]
+    pub verbose: Option<bool>,
+
+    /// Whether to show no output.
+    #[arg(short, long, global = true, action=ArgAction::SetTrue)]
+    pub quiet: Option<bool>,
+
+    /// Whether to show debug output.
+    #[arg(short, long, global = true, action=ArgAction::SetTrue)]
+    pub debug: Option<bool>,
+
+    /// Whether to add the image field into json output.
+    #[arg(long, global = true)]
+    pub include_image_in_json: Option<bool>,
+
+    /// Which mode to use for the color scheme
+    #[arg(
+        value_enum,
+        short,
+        long,
+        global = true,
+        value_name = "MODE",
+        default_value = "dark"
+    )]
+    pub mode: Option<SchemesEnum>,
+
+    /// Will not generate templates, reload apps, set wallpaper or run any commands
+    #[arg(long, global = true, action=ArgAction::SetTrue)]
+    pub dry_run: Option<bool>,
+
+    /// Whether to show colors or not
+    #[arg(long, global = true, action=ArgAction::SetTrue, default_value = "false")]
+    pub show_colors: Option<bool>,
+
+    #[cfg(feature = "dump-json")]
+    /// Whether to dump json of colors
+    #[arg(value_enum, short, long, global = true, value_name = "JSON")]
+    pub json: Option<Format>,
+
+    /// Imports a json file to use as render data (can be used multiple times)
+    #[arg(value_enum, long, global = true, value_name = "FILE")]
+    pub import_json: Option<Vec<String>>,
+
+    /// Imports a json string to use as render data (can be used multiple times)
+    #[arg(value_enum, long, global = true, value_name = "STRING")]
+    pub import_json_string: Option<Vec<String>>,
+
+    /// Uses a custom resize filter for extracting source color
+    #[arg(value_enum, short, long, global = true)]
+    pub resize_filter: Option<FilterType>,
+
+    #[arg(long, global = true, action=ArgAction::SetTrue)]
+    pub continue_on_error: Option<bool>,
+
+    /// The color which should be used as the source_color if no good color was found from an image. (Overrides config value)
+    #[arg(value_enum, long, global = true, value_name = "STRING")]
+    pub fallback_color: Option<String>,
+
+    /// When multiple colors can be extracted from an image, this will decide which to pick without needing user input.
+    #[arg(value_enum, long, global = true)]
+    pub prefer: Option<SelectionPreference>,
+
+    /// Whether to make the outputted json be like before version 4.0.0
+    #[arg(long, global = true, action=ArgAction::SetTrue)]
+    pub old_json_output: Option<bool>,
+
+    /// Backend to use for base16 color scheme generation
+    #[arg(value_enum, short, long, global = true)]
+    pub base16_backend: Option<Backend>,
+
+    #[cfg(feature = "filter-docs")]
+    /// Outputs filter documentation in HTML format
+    #[arg(long, global = true, action=ArgAction::SetTrue)]
+    pub filter_docs_html: Option<bool>,
+
+    /// Value from -∞ to 1. -∞ represents minimum lightness, 0 represents
+    /// standard (i.e. the design as spec'd), and 1 represents maximum lightness.
+    /// For dark schemes, if the considered lightnesses are between 0 and 1 then this applies an affine
+    /// transformation to the lightness by keeping the value for 1 at 1 and setting the
+    /// value for 0 to the lightness argument and then clamping the result
+    #[arg(long, global = true, allow_negative_numbers = true)]
+    pub lightness_dark: Option<f64>,
+
+    /// Value from -1 to +∞. -1 represents minimum lightness, 0 represents
+    /// standard (i.e. the design as spec'd), and +∞ represents maximum lightness.
+    /// For light schemes, if the considered lightnesses are between 0 and 1 then this applies an affine
+    /// transformation to the lightness by keeping the value for 0 at 0 and setting the
+    /// value for 1 to (1 + the lightness argument) and then clamping the result
+    #[arg(long, global = true, allow_negative_numbers = true)]
+    pub lightness_light: Option<f64>,
+
+    /// Will automatically pick a source color based on the index provided (0 - 4)
+    /// 0 = most dominant, 1 = 2nd most dominant, etc.
+    ///
+    /// Setting this to any value will not show the selection prompt.
+    /// In earlier versions the default was 0.
+    #[arg(long, global = true, value_parser = clap::builder::RangedI64ValueParser::<i64>::new().range(0..4))]
+    pub source_color_index: Option<i64>,
+
+    /// Will print the possible source colors for an image instead of setting a theme
+    #[arg(long, global = true, action=ArgAction::SetTrue)]
+    pub show_source_colors: Option<bool>,
+
+    // Value from 0.0 to 1.0 (inclusive)
+    // This will set the opacity for all colors inside templates.
+    #[arg(long, global = true , value_parser = |s: &str| validate_float_range(s, 0.0..=1.0))]
+    pub opacity: Option<f64>,
+}
+
+fn validate_float_range<R>(s: &str, range: R) -> Result<f64, String>
+where
+    R: RangeBounds<f64> + Debug,
+{
+    let val: f64 = s
+        .parse()
+        .map_err(|_| format!("`{s}` isn't a valid number"))?;
+
+    if (range).contains(&val) {
+        Ok(val)
+    } else {
+        Err(format!("Value {val} is out of range (0.0..1.0)"))
+    }
+}
+
+#[derive(Parser, Debug, Clone, clap::ValueEnum)]
+pub enum FilterType {
+    Nearest,
+    Triangle,
+    CatmullRom,
+    Gaussian,
+    Lanczos3,
+}
+
+impl From<&FilterType> for image::imageops::FilterType {
+    fn from(filter: &FilterType) -> Self {
+        match filter {
+            FilterType::Nearest => Self::Nearest,
+            FilterType::Triangle => Self::Triangle,
+            FilterType::CatmullRom => Self::CatmullRom,
+            FilterType::Gaussian => Self::Gaussian,
+            FilterType::Lanczos3 => Self::Lanczos3,
+        }
+    }
+}
+
+#[derive(Parser, Debug)]
+pub enum ColorFormat {
+    Hex { string: String },
+    Rgb { string: String },
+    Hsl { string: String },
+}
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum Format {
+    Hex,
+    Rgb,
+    Rgba,
+    Hsl,
+    Hsla,
+    Strip,
+}
+
+impl ToString for Format {
+    fn to_string(&self) -> String {
+        match &self {
+            Format::Hex => "hex",
+            Format::Rgb => "rgb",
+            Format::Rgba => "rgba",
+            Format::Hsl => "hsl",
+            Format::Hsla => "hsla",
+            Format::Strip => "hex_stripped",
+        }
+        .to_owned()
+    }
+}
+
+#[derive(Debug, Clone, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SelectionPreference {
+    Darkness,
+    Lightness,
+    Saturation,
+    LessSaturation,
+    Value,
+    ClosestToFallback,
+}
+
+impl ToString for SelectionPreference {
+    fn to_string(&self) -> String {
+        match &self {
+            SelectionPreference::Darkness => "darkness",
+            SelectionPreference::Lightness => "lightness",
+            SelectionPreference::Saturation => "saturation",
+            SelectionPreference::LessSaturation => "less_saturation",
+            SelectionPreference::Value => "value",
+            SelectionPreference::ClosestToFallback => "closest_to_fallback",
+        }
+        .to_owned()
+    }
+}

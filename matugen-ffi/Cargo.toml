@@ -1,0 +1,104 @@
+[package]
+name = "matugen-ffi"
+version = "4.1.0"
+authors = ["InioX"]
+description = "FFI bindings (C-ABI) for matugen's core color extraction and template rendering logic"
+repository = "https://github.com/InioX/matugen"
+categories = ["command-line-utilities"]
+license = "GPL-2.0-or-later"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "matugen_ffi"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "matugen"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+winapi = { version = "0.3", features = ["winuser"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+enquote = "1.1.0"
+
+[features]
+filter-docs = []
+default = ["dump-json", "jxl-image", "ffi"]
+update-informer = ["dep:update-informer"]
+web-image = ["dep:reqwest"]
+dump-json = []
+jxl-image = ["dep:jxl-oxide"]
+# Exposes the extern "C" FFI surface (matugen_extract_colors, matugen_render_template,
+# matugen_write_output, matugen_free_string). Disable for a lean CLI-only build.
+ffi = []
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[dependencies]
+# Engine
+indexmap = { version = "2.7.0", features = ["serde"] }
+ariadne = { version = "0.5.1" }
+chumsky = { version = "0.10.0" }
+thiserror = "2.0.12"
+
+# logging
+log = "0.4.17"
+paris-log = { version = "1.0.2", features = [
+  "icons",
+] } # TODO replace with using paris directly?
+pretty_env_logger = "0.5.0"
+
+# terminal output
+comfy-table = { version = "7.2.2" }
+color-eyre = { version = "0.6.2", default-features = false }
+colorsys = { default-features = false, version = "0.6.7" }
+owo-colors = "4.0.0"
+
+# config
+serde = { version = "1.0.160", features = [
+  "serde_derive",
+  "std",
+], default-features = false }
+toml = { features = [
+  "parse",
+  "display",
+], default-features = false, version = "0.8.8" }
+
+clap = { version = "4.2.4", features = [
+  "derive",
+  "std",
+], default-features = true }
+material-colors = { version = "0.4.0", features = ["image", "serde"] }
+image = { default-features = false, version = "0.25.2" }
+directories = "5.0"
+
+# should probably be removed
+resolve-path = "0.1.0"
+execute = "0.2.15"
+
+# update-informer feature
+update-informer = { version = "1.1.0", optional = true }
+
+# used unconditionally: the CLI's --json/--dump flags as well as the FFI request/response
+# structs both need it, so it is no longer optional.
+serde_json = { version = "1.0.107" }
+
+# web-image feature
+reqwest = { version = "0.12.5", default-features = false, features = [
+  "blocking",
+  "rustls-tls",
+], optional = true }
+
+sha2 = "0.10.9"
+base64 = "0.22"
+csscolorparser = "0.7.2"
+convert_case = "0.10.0"
+palette = "0.7.6"
+dialoguer = { version = "0.12.0", default-features = false }
+
+# Jxl image feature
+jxl-oxide = { version = "0.12.5", features = ["image"], optional = true }

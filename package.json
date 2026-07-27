@@ -1,0 +1,27 @@
+{
+  "name": "matugen-ts",
+  "version": "0.1.0",
+  "description": "Bun/TypeScript bindings for libmatugen (matugen's C-ABI FFI surface)",
+  "module": "src/index.ts",
+  "type": "module",
+  "types": "src/index.ts",
+  "license": "GPL-2.0-or-later",
+  "scripts": {
+    "example:extract-color": "bun run examples/example-extract-color.ts",
+    "example:extract-image": "bun run examples/example-extract-image.ts",
+    "example:extract-buffer": "bun run examples/example-extract-buffer.ts",
+    "example:render-inline": "bun run examples/example-render-inline.ts",
+    "example:render-file": "bun run examples/example-render-file.ts",
+    "example:render-source": "bun run examples/example-render-source.ts",
+    "example:render-from-image": "bun run examples/example-render-from-image.ts",
+    "example:write-output": "bun run examples/example-write-output.ts",
+    "example:full-pipeline": "bun run examples/example-full-pipeline.ts",
+    "example:load-template": "bun run examples/load-template.ts",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  },
+  "private": true
+}

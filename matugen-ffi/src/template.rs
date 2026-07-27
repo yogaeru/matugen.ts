@@ -1,0 +1,575 @@
+use color_eyre::{
+    eyre::{ContextCompat, Result, WrapErr},
+    Help, Report,
+};
+use execute::{shell, Execute};
+use material_colors::theme::Theme;
+use serde_json::json;
+
+use crate::{
+    color::color::get_closest_color,
+    helpers::{
+        apply_opacity_to_schemes, generate_schemes_and_theme, get_syntax, merge_json_source,
+    },
+    parser::Engine,
+    scheme::{SchemeTypes, Schemes},
+};
+use serde::{Deserialize, Serialize};
+
+use std::{collections::HashMap, path::Path, str};
+
+use std::{
+    fs::{create_dir_all, read_to_string, OpenOptions},
+    io::Write,
+    path::PathBuf,
+};
+
+use directories::BaseDirs;
+use resolve_path::PathResolveExt;
+
+use crate::{SchemesEnum, State};
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Template {
+    pub input_path: PathBuf,
+    pub output_path: Option<OutputPath>,
+    pub mode: Option<SchemesEnum>,
+    pub colors_to_compare: Option<Vec<crate::color::color::ColorDefinition>>,
+    pub compare_to: Option<String>,
+    pub pre_hook: Option<String>,
+    pub post_hook: Option<String>,
+    pub input_path_modes: Option<InputPathModes>,
+    pub expr_prefix: Option<String>,
+    pub expr_postfix: Option<String>,
+    pub block_prefix: Option<String>,
+    pub block_postfix: Option<String>,
+    pub index: Option<i32>,
+    pub r#type: Option<SchemeTypes>,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(untagged)]
+pub enum OutputPath {
+    Single(PathBuf),
+    Multiple(Vec<PathBuf>),
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct InputPathModes {
+    pub light: PathBuf,
+    pub dark: PathBuf,
+}
+
+pub struct TemplateFile<'a> {
+    state: &'a State,
+    engine: &'a mut Engine,
+    scheme_cache: HashMap<SchemeTypes, SchemeCacheEntry>,
+}
+
+#[derive(Debug)]
+pub struct SchemeCacheEntry {
+    pub schemes: Option<Schemes>,
+    pub base16: Option<Schemes>,
+    pub theme: Option<Theme>,
+}
+
+impl TemplateFile<'_> {
+    pub fn new<'a>(state: &'a State, engine: &'a mut Engine) -> TemplateFile<'a> {
+        TemplateFile {
+            state,
+            engine,
+            scheme_cache: HashMap::new(),
+        }
+    }
+
+    pub fn generate(&mut self) -> Result<(), Report> {
+        info!(
+            "Loaded <b><cyan>{}</> templates.",
+            &self.state.config_file.templates.len()
+        );
+
+        let mut paths_hashmap = HashMap::new();
+
+        for (_i, (name, template)) in self.state.config_file.templates.iter().enumerate() {
+            if !template.enabled.unwrap_or(true) {
+                debug!("Skipping disabled template: {}", name);
+                continue;
+            }
+
+            let input_path = if let Some(input_path_mode) = &template.input_path_modes {
+                match self.state.default_scheme {
+                    SchemesEnum::Light => &input_path_mode.light,
+                    SchemesEnum::Dark => &input_path_mode.dark,
+                    SchemesEnum::Smart => unreachable!("default_scheme is resolved before storage"),
+                }
+            } else {
+                &template.input_path
+            };
+
+            let (input_path_absolute, output_paths_absolute) =
+                get_absolute_paths(&self.state.config_path, input_path, &template.output_path)?;
+
+            if !input_path_absolute.exists() {
+                warn!("<d>The <yellow><b>{}</><d> template in <u>{}</><d> doesn't exist, skipping...</>", name, input_path_absolute.display());
+                continue;
+            }
+
+            let old_syntax = match (
+                &template.block_prefix,
+                &template.block_postfix,
+                &template.expr_prefix,
+                &template.expr_postfix,
+            ) {
+                (None, None, None, None) => None,
+                _ => {
+                    let old_syntax = self.engine.set_syntax(get_syntax(
+                        template.block_prefix.as_ref(),
+                        template.block_postfix.as_ref(),
+                        template.expr_prefix.as_ref(),
+                        template.expr_postfix.as_ref(),
+                    ));
+                    Some(old_syntax)
+                }
+            };
+
+            let data = read_to_string(&input_path_absolute)
+                .wrap_err(format!("Could not read the {} template.", name))
+                .suggestion("Try converting the file to use UTF-8 encoding.")?;
+
+            self.engine.add_template(name.to_string(), data);
+
+            for output_path in output_paths_absolute {
+                paths_hashmap.insert(
+                    name.to_string(),
+                    (input_path_absolute.to_path_buf(), output_path),
+                );
+            }
+
+            if let Some(old) = old_syntax {
+                self.engine.set_syntax(old);
+            };
+        }
+
+        // Iterate over sorted templates when running command hooks
+        let mut templates: Vec<(&String, &Template)> =
+            self.state.config_file.templates.iter().collect();
+        // Templates with an unspecified `index` default to 0
+        templates.sort_by_key(|(_, Template { index, .. })| index.unwrap_or(0));
+
+        for (name, template) in templates {
+            if !template.enabled.unwrap_or(true) {
+                continue;
+            }
+
+            let scheme_type = template.r#type.map(|t| match t {
+                SchemeTypes::SchemeSmart => self.state.smart_variant,
+                other => other,
+            });
+            if let Some(scheme_type) = scheme_type {
+                if let Some(entry) = self.scheme_cache.get(&scheme_type) {
+                    change_scheme_type(
+                        self.engine,
+                        &entry.schemes,
+                        &entry.base16,
+                        &entry.theme,
+                        self.state.default_scheme,
+                    )?;
+                } else {
+                    let (mut schemes, _, theme, mut base16) = generate_schemes_and_theme(
+                        &self.state.args,
+                        &self.state.config_file,
+                        scheme_type,
+                    )?;
+
+                    apply_opacity_to_schemes(&mut base16, self.state.args.opacity);
+                    apply_opacity_to_schemes(&mut schemes, self.state.args.opacity);
+
+                    change_scheme_type(
+                        self.engine,
+                        &schemes,
+                        &base16,
+                        &theme,
+                        self.state.default_scheme,
+                    )?;
+
+                    self.scheme_cache.insert(
+                        scheme_type,
+                        SchemeCacheEntry {
+                            schemes,
+                            base16,
+                            theme,
+                        },
+                    );
+                }
+            }
+
+            if let Some(hook) = &template.pre_hook {
+                info!("Running pre_hook for the <b><cyan>{}</> template.", &name);
+                format_hook(
+                    self.engine,
+                    &hook,
+                    &template.colors_to_compare,
+                    &template.compare_to,
+                )
+                .wrap_err(format!("Failed to format the following hook:\n{}", hook))?;
+            }
+
+            if template.output_path.is_some() {
+                let (input_path_absolute, output_path_absolute) = paths_hashmap
+                    .get(name)
+                    .wrap_err("Failed to get the input and output paths from hashmap")?;
+
+                debug!(
+                    "Trying to write the {} template from {} to {}",
+                    name,
+                    input_path_absolute.display(),
+                    output_path_absolute.display()
+                );
+
+                self.export_template(name, output_path_absolute)?;
+            }
+
+            if let Some(hook) = &template.post_hook {
+                info!("Running post_hook for the <b><cyan>{}</> template.", &name);
+                format_hook(
+                    self.engine,
+                    &hook,
+                    &template.colors_to_compare,
+                    &template.compare_to,
+                )
+                .wrap_err(format!("Failed to format the following hook:\n{}", hook))?;
+            }
+
+            if let Some(_) = template.r#type {
+                change_scheme_type(
+                    self.engine,
+                    &self.state.schemes,
+                    &self.state.base16,
+                    &self.state.theme,
+                    self.state.default_scheme,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn export_template(&self, name: &String, output_path_absolute: &PathBuf) -> Result<(), Report> {
+        let data = match self.engine.render(name) {
+            Ok(v) => v,
+            Err(errors) => {
+                for err in &errors {
+                    err.emit(self.engine)?;
+                }
+
+                if self.state.args.continue_on_error.unwrap_or(false) {
+                    return Ok(());
+                }
+
+                return Err(Report::msg(format!(
+                    "Failed to render the {} template: {}",
+                    name,
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )));
+            }
+        };
+
+        match write_to_disk(&data, output_path_absolute, &self.state.args.prefix, true) {
+            Ok(Some(written_path)) => {
+                success!(
+                    "Exported the <b><green>{}</> template to <d><u>{}</>",
+                    name,
+                    written_path.display()
+                );
+                Ok(())
+            }
+            Ok(None) => {
+                error!(
+                    "The <b><red>{}</> file is <b><red>Read-Only</>, not writing to it.",
+                    &output_path_absolute.display()
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Writes rendered template `content` to `output_path`, applying the same
+/// prefix/read-only/missing-folder handling as the CLI's `export_template`.
+///
+/// Returns `Ok(Some(path))` with the final path written to on success,
+/// `Ok(None)` if the target file exists and is read-only (skipped, not an
+/// error), or `Err` on I/O failure. This is a pure function with no
+/// dependency on `State`/`Engine`, making it reusable from the FFI
+/// `matugen_write_output` entrypoint.
+pub fn write_to_disk(
+    content: &str,
+    output_path_absolute: &Path,
+    prefix: &Option<PathBuf>,
+    create_missing_dirs: bool,
+) -> Result<Option<PathBuf>, Report> {
+    let out = if let Some(prefix) = prefix {
+        if cfg!(windows) {
+            output_path_absolute.to_path_buf()
+        } else {
+            let mut prefix_path = PathBuf::from(prefix);
+
+            let output_path = match output_path_absolute.strip_prefix("/") {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(Report::msg(format!(
+                        "Output path is not an absolute path: {}",
+                        e
+                    )))
+                }
+            };
+
+            prefix_path.push(output_path);
+
+            prefix_path
+        }
+    } else {
+        output_path_absolute.to_path_buf()
+    };
+
+    if create_missing_dirs {
+        create_missing_folders(&out).wrap_err(format!(
+            "Failed to create the missing folders for {}",
+            &out.display()
+        ))?;
+    }
+
+    debug!("out: {:?}", out);
+
+    if out.exists() {
+        let meta = std::fs::metadata(&out).wrap_err(format!(
+            "Failed to get file metadata for {}",
+            &out.display()
+        ))?;
+
+        if meta.permissions().readonly() {
+            return Ok(None);
+        }
+    }
+
+    let mut output_file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&out)?;
+
+    output_file.write_all(content.as_bytes())?;
+
+    Ok(Some(out))
+}
+
+fn change_scheme_type(
+    engine: &mut Engine,
+    md3_schemes: &Option<Schemes>,
+    base16_schemes: &Option<Schemes>,
+    theme: &Option<Theme>,
+    default_scheme: SchemesEnum,
+) -> Result<(), Report> {
+    engine.remove_key_from_context("colors");
+    engine.remove_key_from_context("base16");
+    engine.remove_key_from_context("palettes");
+
+    let json = merge_json_source(
+        serde_json::json!({}),
+        md3_schemes,
+        base16_schemes,
+        theme,
+        default_scheme,
+    )?;
+
+    engine.add_context(json);
+
+    Ok(())
+}
+
+/// Captured output of a `pre_hook`/`post_hook` command execution.
+#[derive(Debug, Clone, Serialize)]
+pub struct HookOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+}
+
+fn compile_or_err(engine: &mut Engine, hook: &str, source: String) -> Result<String, Report> {
+    match engine.compile(source) {
+        Ok(v) => Ok(v),
+        Err(errors) => {
+            let messages = errors
+                .iter()
+                .map(|e| e.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            Err(Report::msg(format!(
+                "Error when formatting hook:\n{}\n{}",
+                hook, messages
+            )))
+        }
+    }
+}
+
+pub fn format_hook(
+    engine: &mut Engine,
+    hook: &String,
+    colors_to_compare: &Option<Vec<crate::color::color::ColorDefinition>>,
+    compare_to: &Option<String>,
+) -> Result<HookOutput, Report> {
+    if let (Some(compare), Some(to)) = (colors_to_compare, compare_to) {
+        let res = compile_or_err(engine, hook, to.to_string())?;
+        let closest_color = get_closest_color(compare, &res)?;
+        engine.add_context(json!({
+            "closest_color": closest_color
+        }));
+    }
+
+    let res = compile_or_err(engine, hook, hook.to_string())?;
+
+    let res = expand_tilde(&res);
+    let mut command = shell(&res);
+
+    // FIXME: figure out why this doesnt work even though its in the docs
+    // command.stdout(Stdio::piped());
+    // command.stderr(Stdio::piped());
+
+    let output = command.execute_output()?;
+
+    let exit_code = output.status.code();
+    if let Some(code) = exit_code {
+        if code != 0 {
+            error!("Failed executing command: {:?}", &res)
+        }
+    } else {
+        eprintln!("Interrupted!");
+    }
+
+    let stdout = String::from_utf8(output.stdout).unwrap_or_default();
+    let stderr = String::from_utf8(output.stderr).unwrap_or_default();
+
+    if !stdout.is_empty() {
+        success!("<green><b>Stdout:</>\n{}", stdout);
+    }
+    if !stderr.is_empty() {
+        error!("<red><b>Stderr:</>\n{}", stderr);
+    }
+
+    Ok(HookOutput {
+        stdout,
+        stderr,
+        exit_code,
+    })
+}
+
+fn expand_tilde(input: &str) -> String {
+    let Some(base_dirs) = BaseDirs::new() else {
+        return input.to_string();
+    };
+    let home = base_dirs.home_dir().to_string_lossy().to_string();
+    input
+        .replace("~/", &format!("{}{}", home, std::path::MAIN_SEPARATOR))
+        .replace(
+            &format!("~{}", std::path::MAIN_SEPARATOR),
+            &format!("{}{}", home, std::path::MAIN_SEPARATOR),
+        )
+}
+
+#[allow(clippy::manual_strip)]
+pub trait StripCanonicalization
+where
+    Self: AsRef<Path>,
+{
+    #[cfg(not(target_os = "windows"))]
+    fn strip_canonicalization(&self) -> PathBuf {
+        self.as_ref().to_path_buf()
+    }
+
+    #[cfg(target_os = "windows")]
+    fn strip_canonicalization(&self) -> PathBuf {
+        const VERBATIM_PREFIX: &str = r#"\\?\"#;
+        let p = self.as_ref().display().to_string();
+        if p.starts_with(VERBATIM_PREFIX) {
+            PathBuf::from(&p[VERBATIM_PREFIX.len()..])
+        } else {
+            self.as_ref().to_path_buf()
+        }
+    }
+}
+
+impl StripCanonicalization for PathBuf {}
+
+fn create_missing_folders(output_path_absolute: &Path) -> Result<(), Report> {
+    let parent_folder = &output_path_absolute
+        .parent()
+        .wrap_err("Could not get the parent of the output path.")?;
+    if !parent_folder.exists() {
+        error!(
+            "The <b><yellow>{}</> folder doesnt exist, trying to create...",
+            &parent_folder.display()
+        );
+        debug!("{}", parent_folder.display());
+        create_dir_all(parent_folder)?;
+    };
+    Ok(())
+}
+
+pub fn get_absolute_path(base_path: &PathBuf, relative_path: &PathBuf) -> Result<PathBuf, Report> {
+    let base = std::fs::canonicalize(base_path)?;
+    let absolute = relative_path
+        .try_resolve_in(&base)?
+        .to_path_buf()
+        .strip_canonicalization();
+    Ok(absolute)
+}
+
+fn get_absolute_paths(
+    config_path: &Option<PathBuf>,
+    input_path: &PathBuf,
+    output_paths: &Option<OutputPath>,
+) -> Result<(PathBuf, Vec<PathBuf>), Report> {
+    let output_paths = match output_paths {
+        Some(OutputPath::Single(path)) => &Vec::from([path.to_path_buf()]),
+        Some(OutputPath::Multiple(paths)) => paths,
+        None => &Vec::new(),
+    };
+
+    let (input_path_absolute, output_paths_absolute) = if let Some(p) = config_path {
+        let base = std::fs::canonicalize(p)?;
+        let mut paths = Vec::new();
+
+        for output_path in output_paths {
+            paths.push(
+                output_path
+                    .try_resolve_in(&base)?
+                    .to_path_buf()
+                    .strip_canonicalization(),
+            );
+        }
+
+        (
+            input_path
+                .try_resolve_in(&base)?
+                .to_path_buf()
+                .strip_canonicalization(),
+            paths,
+        )
+    } else {
+        let mut paths = Vec::new();
+
+        for output_path in output_paths {
+            paths.push(output_path.try_resolve()?.to_path_buf());
+        }
+
+        (input_path.try_resolve()?.to_path_buf(), paths)
+    };
+    Ok((input_path_absolute, output_paths_absolute))
+}
